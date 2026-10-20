@@ -6,6 +6,10 @@
     },
     "blog:eda0f6576108b10eb3022371": {
       "phase": "baseline"
+    },
+    "schedule:2026-10-20:sannomiya": {
+      "marker": "yurikago-auto-v1:a05897743f6cc9f206edcf90b85425ab1887495f5822a6aa9a3df0f3c6ca0c26",
+      "phase": "creating"
     }
   },
   "version": 1
