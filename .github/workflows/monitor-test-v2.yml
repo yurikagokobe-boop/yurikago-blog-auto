@@ -1,0 +1,85 @@
+
+name: Yurikago schedule monitor test v2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Check official pages
+        run: |
+          python3 - <<'PY'
+          import urllib.request
+          import hashlib
+          import sys
+          from datetime import datetime, timezone, timedelta
+
+          today = datetime.now(
+              timezone(timedelta(hours=9))
+          ).strftime("%Y-%m-%d")
+
+          pages = {
+              "新着情報": "https://yurikago-kobe.com/topics.php",
+              "出勤情報（三宮）": (
+                  "https://yurikago-kobe.com/schedule.php"
+                  "?area=sannomiya&date=" + today
+              ),
+              "出勤情報（JR尼崎）": (
+                  "https://yurikago-kobe.com/schedule.php"
+                  "?area=amagasaki&date=" + today
+              ),
+          }
+
+          failed = False
+
+          for name, url in pages.items():
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "YurikagoWebsiteMonitor/1.0"
+                  },
+              )
+
+              try:
+                  with urllib.request.urlopen(
+                      request, timeout=20
+                  ) as response:
+                      status = response.status
+                      body = response.read()
+
+                  if status != 200:
+                      print(f"ERROR: {name}: HTTP {status}")
+                      failed = True
+                      continue
+
+                  if not body or b"<html" not in body.lower():
+                      print(f"WARNING: {name}: HTMLを確認できません")
+                      failed = True
+                      continue
+
+                  digest = hashlib.sha256(body).hexdigest()[:12]
+                  print(
+                      f"OK: {name}: HTTP {status}, "
+                      f"HTML取得成功, fingerprint={digest}"
+                  )
+
+              except Exception as exc:
+                  print(f"ERROR: {name}: {type(exc).__name__}")
+                  failed = True
+
+          if failed:
+              print("テストに問題があります。投稿は行っていません。")
+              sys.exit(1)
+
+          print(
+              "取得テスト成功。今回は取得確認のみで、"
+              "投稿・状態保存は行っていません。"
+          )
+          PY
