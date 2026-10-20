@@ -7,6 +7,10 @@
     "blog:eda0f6576108b10eb3022371": {
       "phase": "baseline"
     },
+    "schedule:2026-10-20:amagasaki": {
+      "marker": "yurikago-auto-v1:b1887a866649aaf2d563a7eeaf67cdaecf56daa6869e068bdb3e66629b7800f9",
+      "phase": "creating"
+    },
     "schedule:2026-10-20:sannomiya": {
       "article_id": "31010088",
       "hash": "b98ec394ebb8c10bfe7a1c7ff594044f8e64b14b942e5cbc8173b61e8c5bc94a",
