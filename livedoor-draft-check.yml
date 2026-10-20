@@ -1,0 +1,173 @@
+name: Livedoor draft check
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: livedoor-yurikago-kobe-draft-check
+  cancel-in-progress: false
+
+jobs:
+  draft-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Create and verify one draft
+        env:
+          LIVEDOOR_ID: ${{ secrets.LIVEDOOR_ID }}
+          LIVEDOOR_API_PASSWORD: ${{ secrets.LIVEDOOR_API_PASSWORD }}
+        run: |
+          python3 - <<'PYTHON'
+          import base64
+          import hashlib
+          import os
+          import re
+          import socket
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+
+          BLOG = "yurikago_kobe"
+          API = f"https://livedoor.blogcms.jp/atom/blog/{BLOG}/article"
+          TITLE = "【非公開テスト】ゆりかご神戸尼崎・自動投稿の保存確認"
+          MARKER = "yurikago-draft-check-20261020-v1"
+          ATOM = "http://www.w3.org/2005/Atom"
+          APP = "http://www.w3.org/2007/app"
+          NS = {"atom": ATOM, "app": APP}
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def request(method, url, data=None):
+              # Credentials are sent only to this blog's documented HTTPS API.
+              if url != API and not re.fullmatch(re.escape(API) + r"/\d+", url):
+                  raise RuntimeError("想定外のAPI接続先のため停止しました。")
+              username = os.environ["LIVEDOOR_ID"].strip()
+              password = os.environ["LIVEDOOR_API_PASSWORD"].strip()
+              created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+              nonce = os.urandom(20)
+              digest = base64.b64encode(
+                  hashlib.sha1(nonce + created.encode() + password.encode()).digest()
+              ).decode()
+              wsse = (
+                  f'UsernameToken Username="{username}", PasswordDigest="{digest}", '
+                  f'Nonce="{base64.b64encode(nonce).decode()}", Created="{created}"'
+              )
+              req = urllib.request.Request(url, data=data, method=method, headers={
+                  "Authorization": 'WSSE profile="UsernameToken"',
+                  "X-WSSE": wsse,
+                  "Accept": "application/atom+xml",
+                  "Content-Type": "application/atom+xml;type=entry;charset=utf-8",
+                  "User-Agent": "YurikagoDraftCheck/1.0",
+              })
+              try:
+                  with urllib.request.build_opener(NoRedirect()).open(req, timeout=30) as res:
+                      status, location, body = res.status, res.headers.get("Location", ""), res.read()
+              except urllib.error.HTTPError as exc:
+                  raise RuntimeError(
+                      f"HTTP {exc.code}で停止しました。認証情報や応答本文は表示しません。"
+                  ) from None
+              except (urllib.error.URLError, TimeoutError, socket.timeout):
+                  raise RuntimeError(
+                      "通信に失敗しました。投稿結果が不明な場合は、再実行前に管理画面を確認してください。"
+                  ) from None
+              if status not in (200, 201):
+                  raise RuntimeError(f"想定外のHTTP {status}で停止しました。")
+              return location, ET.fromstring(body)
+
+
+          def article_id(entry, location=""):
+              urls = [location] + [link.get("href", "") for link in entry.findall("atom:link", NS)]
+              for url in urls:
+                  parsed = urllib.parse.urlsplit(url)
+                  match = re.search(r"/" + re.escape(BLOG) + r"/article/(\d+)/?$", parsed.path)
+                  if parsed.hostname == "livedoor.blogcms.jp" and match:
+                      return match.group(1)
+              atom_id = entry.findtext("atom:id", default="", namespaces=NS)
+              if BLOG in atom_id:
+                  match = re.search(r"[./](\d+)$", atom_id)
+                  if match:
+                      return match.group(1)
+              raise RuntimeError("記事IDを確認できません。再実行前にライブドアの記事一覧を確認してください。")
+
+
+          def verify(entry):
+              if entry.tag != f"{{{ATOM}}}entry":
+                  raise RuntimeError("記事の取得結果が想定した形式ではありません。")
+              if entry.findtext("atom:title", default="", namespaces=NS) != TITLE:
+                  raise RuntimeError("記事タイトルが一致しないため停止しました。")
+              if MARKER not in ET.tostring(entry, encoding="unicode"):
+                  raise RuntimeError("テスト記事の識別子が一致しないため停止しました。")
+              draft = entry.findtext("app:control/app:draft", default="", namespaces=NS).strip()
+              if draft != "yes":
+                  raise RuntimeError("draft=yesを確認できません。管理画面で公開状態を確認してください。")
+
+
+          def payload():
+              ET.register_namespace("", ATOM)
+              ET.register_namespace("app", APP)
+              entry = ET.Element(f"{{{ATOM}}}entry")
+              ET.SubElement(entry, f"{{{ATOM}}}title").text = TITLE
+              ET.SubElement(entry, f"{{{ATOM}}}updated").text = datetime.now(timezone.utc).isoformat()
+              body = (
+                  "<p>ゆりかご神戸尼崎の自動投稿に向けた下書き保存テストです。</p>"
+                  "<p>日本語・改行・リンクの保存状態を確認します。</p>"
+                  '<p><a href="https://yurikago-kobe.com/">ゆりかご神戸尼崎 公式HP</a></p>'
+                  "<p>出勤時間・空き状況・割引の案内を含まないテスト記事です。</p>"
+                  f"<p>確認用識別子：{MARKER}</p>"
+              )
+              ET.SubElement(entry, f"{{{ATOM}}}content", {"type": "text/html"}).text = body
+              control = ET.SubElement(entry, f"{{{APP}}}control")
+              ET.SubElement(control, f"{{{APP}}}draft").text = "yes"
+              return ET.tostring(entry, encoding="utf-8", xml_declaration=True)
+
+
+          def main():
+              username = os.environ.get("LIVEDOOR_ID", "").strip()
+              password = os.environ.get("LIVEDOOR_API_PASSWORD", "").strip()
+              if not username or not password:
+                  raise RuntimeError("GitHub SecretsのLIVEDOOR_IDとLIVEDOOR_API_PASSWORDを確認してください。")
+              if not re.fullmatch(r"[A-Za-z0-9_-]+", username) or any(c in password for c in "\r\n"):
+                  raise RuntimeError("GitHub Secretsの形式を確認してください。値はログに表示しません。")
+
+              _, feed = request("GET", API)
+              if feed.tag != f"{{{ATOM}}}feed":
+                  raise RuntimeError("記事一覧の応答が想定した形式ではありません。")
+              print("OK: ライブドアAPI接続確認")
+              matches = [e for e in feed.findall("atom:entry", NS)
+                         if e.findtext("atom:title", default="", namespaces=NS) == TITLE]
+              if len(matches) > 1:
+                  raise RuntimeError("同名のテスト記事が複数あります。管理画面で確認してください。")
+              if matches:
+                  entry = matches[0]
+                  if MARKER not in ET.tostring(entry, encoding="unicode"):
+                      raise RuntimeError("同名の別記事があります。既存記事は変更せず停止しました。")
+                  aid = article_id(entry)
+                  print("INFO: 最新の記事一覧に同じテスト記事があるため、新規作成を省略します。")
+              else:
+                  # POST is sent once. Do not retry automatically after an uncertain result.
+                  location, entry = request("POST", API, payload())
+                  aid = article_id(entry, location)
+              print(f"記事ID: {aid}")
+              _, saved = request("GET", f"{API}/{aid}")
+              verify(saved)
+              print("OK: 下書き保存確認（draft=yes）")
+              print("記事タイトル: " + TITLE)
+              print("ライブドア管理画面でも「下書き」と本文・リンクの表示を確認してください。")
+              print("公開操作・既存記事の編集や削除・定期実行は行っていません。")
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except (RuntimeError, ET.ParseError) as exc:
+                  print("ERROR: " + str(exc))
+                  raise SystemExit(1)
+          PYTHON
