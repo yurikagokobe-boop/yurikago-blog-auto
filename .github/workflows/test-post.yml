@@ -1,0 +1,55 @@
+
+name: Livedoor API connection test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  connection-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Livedoor AtomPub connection
+        env:
+          LIVEDOOR_ID: ${{ secrets.LIVEDOOR_ID }}
+          LIVEDOOR_API_PASSWORD: ${{ secrets.LIVEDOOR_API_PASSWORD }}
+        run: |
+          python - <<'PY'
+          import os
+          import base64
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          username = os.environ["LIVEDOOR_ID"]
+          password = os.environ["LIVEDOOR_API_PASSWORD"]
+
+          if not username or not password:
+              raise SystemExit("GitHub Secretsが未登録です")
+
+          url = "https://livedoor.blogcms.jp/atompub/yurikago_kobe/article"
+          token = base64.b64encode(
+              f"{username}:{password}".encode()
+          ).decode()
+
+          req = urllib.request.Request(
+              url,
+              headers={
+                  "Authorization": "Basic " + token,
+                  "Accept": "application/atom+xml",
+              },
+          )
+
+          with urllib.request.urlopen(req, timeout=30) as response:
+              data = response.read()
+              print("接続成功。HTTP:", response.status)
+
+          root = ET.fromstring(data)
+          ns = {"atom": "http://www.w3.org/2005/Atom"}
+          titles = [
+              item.text for item in root.findall("atom:entry/atom:title", ns)
+          ]
+          print("記事一覧を取得しました。記事数:", len(titles))
+          print("投稿は行っていません。")
+          PY
