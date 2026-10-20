@@ -1,0 +1,12 @@
+{
+  "blog_baseline_done": true,
+  "posts": {
+    "blog:480ae63a6361bbd6eb3dcdd0": {
+      "phase": "baseline"
+    },
+    "blog:eda0f6576108b10eb3022371": {
+      "phase": "baseline"
+    }
+  },
+  "version": 1
+}
