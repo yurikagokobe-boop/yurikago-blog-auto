@@ -1,0 +1,163 @@
+
+name: Livedoor draft test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  draft-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+
+    steps:
+      - name: Create one draft test article
+        env:
+          LIVEDOOR_ID: ${{ secrets.LIVEDOOR_ID }}
+          LIVEDOOR_API_PASSWORD: ${{ secrets.LIVEDOOR_API_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+          import hashlib
+          import base64
+          import secrets
+          import urllib.request
+          import urllib.error
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone, timedelta
+          from xml.sax.saxutils import escape
+
+          BLOG = "yurikago_kobe"
+          ENDPOINT = (
+              "https://livedoor.blogcms.jp/atom/blog/"
+              + BLOG + "/article"
+          )
+          TITLE = "【テスト・下書き】ゆりかごブログ連携確認"
+
+          username = os.environ.get("LIVEDOOR_ID", "")
+          password = os.environ.get("LIVEDOOR_API_PASSWORD", "")
+
+          if not username or not password:
+              print("ERROR: GitHub Secretsが設定されていません。")
+              sys.exit(1)
+
+          def wsse_headers():
+              nonce = secrets.token_bytes(20)
+              created = datetime.now(timezone.utc).strftime(
+                  "%Y-%m-%dT%H:%M:%SZ"
+              )
+              digest = base64.b64encode(
+                  hashlib.sha1(
+                      nonce + created.encode("utf-8")
+                      + password.encode("utf-8")
+                  ).digest()
+              ).decode("ascii")
+              nonce_b64 = base64.b64encode(nonce).decode("ascii")
+
+              def quoted(value):
+                  return value.replace("\\", "\\\\").replace('"', '\\"')
+
+              return {
+                  "Authorization": 'WSSE profile="UsernameToken"',
+                  "X-WSSE": (
+                      'UsernameToken Username="' + quoted(username)
+                      + '", PasswordDigest="' + digest
+                      + '", Nonce="' + nonce_b64
+                      + '", Created="' + created + '"'
+                  ),
+                  "User-Agent": "yurikago-blog-auto/1.0",
+              }
+
+          # 先に最新記事を取得し、同じタイトルがあれば投稿しない。
+          # 取得に失敗した場合も、重複防止のため投稿を中止する。
+          request = urllib.request.Request(
+              ENDPOINT, headers=wsse_headers(), method="GET"
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  feed = ET.fromstring(response.read())
+          except urllib.error.HTTPError as exc:
+              print("ERROR: 事前確認に失敗しました。HTTP", exc.code)
+              sys.exit(1)
+          except Exception:
+              print("ERROR: 事前確認に失敗しました。投稿は行っていません。")
+              sys.exit(1)
+
+          ns = {"atom": "http://www.w3.org/2005/Atom"}
+          existing_titles = [
+              node.text or ""
+              for node in feed.findall(".//atom:entry/atom:title", ns)
+          ]
+
+          if TITLE in existing_titles:
+              print("SKIP: 同じタイトルの記事が見つかりました。投稿しません。")
+              sys.exit(0)
+
+          jst = timezone(timedelta(hours=9))
+          now = datetime.now(jst).isoformat(timespec="seconds")
+
+          body = (
+              "<p>これはライブドアブログ連携の動作確認用テスト記事です。</p>"
+              "<p>日本語表示と段落・改行の確認をしています。</p>"
+              "<p>公式サイト："
+              '<a href="https://yurikago-kobe.com/">ゆりかご神戸 公式サイト</a>'
+              "</p>"
+              "<p>このテスト記事は公開せず、下書きとして保存する想定です。</p>"
+          )
+
+          xml_body = """<?xml version="1.0" encoding="UTF-8"?>
+          <entry xmlns="http://www.w3.org/2005/Atom"
+                 xmlns:app="http://www.w3.org/2007/app"
+                 xmlns:blogcms="http://blogcms.jp/-/spec/atompub/1.0/">
+            <title>{title}</title>
+            <updated>{now}</updated>
+            <published>{now}</published>
+            <author><name>{author}</name></author>
+            <content type="text/html" xml:lang="ja">{content}</content>
+            <blogcms:source>
+              <blogcms:body><![CDATA[{body}]]></blogcms:body>
+            </blogcms:source>
+            <app:control>
+              <app:draft>yes</app:draft>
+            </app:control>
+          </entry>
+          """.format(
+              title=escape(TITLE),
+              now=now,
+              author=escape(username),
+              content=escape(body),
+              body=body,
+          ).encode("utf-8")
+
+          request = urllib.request.Request(
+              ENDPOINT,
+              data=xml_body,
+              headers={
+                  **wsse_headers(),
+                  "Content-Type": "application/atom+xml;type=entry",
+              },
+              method="POST",
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  status = response.status
+                  # レスポンス本文や認証情報はログに出さない。
+                  if 200 <= status < 300:
+                      print("投稿リクエスト成功: HTTP", status)
+                      print("ライブドアブログ管理画面で下書き状態を確認してください。")
+                  else:
+                      print("ERROR: 投稿結果を確認できません。HTTP", status)
+                      sys.exit(1)
+          except urllib.error.HTTPError as exc:
+              print("ERROR: 投稿リクエストが拒否されました。HTTP", exc.code)
+              sys.exit(1)
+          except Exception:
+              print("ERROR: 投稿結果を確認できませんでした。")
+              print("重複投稿を防ぐため、すぐには再実行しないでください。")
+              sys.exit(1)
+          PY
