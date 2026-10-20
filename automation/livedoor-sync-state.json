@@ -10,7 +10,7 @@
     "schedule:2026-10-20:amagasaki": {
       "article_id": "31010089",
       "hash": "ec18dc54afc971740ac5154855a975e70eee275da18b174ea7e63a262f84edb8",
-      "mode": "draft",
+      "mode": "publish",
       "phase": "active"
     },
     "schedule:2026-10-20:sannomiya": {
