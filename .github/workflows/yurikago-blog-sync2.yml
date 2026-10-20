@@ -1,0 +1,471 @@
+name: Yurikago blog sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'preview=表示確認 / draft=下書き保存 / publish=公開反映'
+        required: true
+        default: preview
+        type: choice
+        options:
+          - preview
+          - draft
+          - publish
+  schedule:
+    # 毎朝8:00（日本時間）に当日の出勤情報を公開します。
+    - cron: '0 23 * * *'
+    # 公開後の出勤変更と、公式HPブログの更新を毎時確認します。
+    - cron: '17 * * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yurikago-livedoor-production-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || vars.LIVEDOOR_SYNC_ENABLED == 'true')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - name: Sync official content
+        env:
+          TRIGGER_KIND: ${{ github.event_name }}
+          SYNC_MODE: ${{ github.event_name == 'schedule' && (vars.LIVEDOOR_SYNC_MODE || 'draft') || inputs.mode }}
+          LIVEDOOR_ID: ${{ secrets.LIVEDOOR_ID }}
+          LIVEDOOR_API_PASSWORD: ${{ secrets.LIVEDOOR_API_PASSWORD }}
+        run: |
+          python3 - <<'PYTHON'
+          import base64
+          import copy
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import socket
+          import subprocess
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timedelta, timezone
+          from html.parser import HTMLParser
+          from pathlib import Path
+          from zoneinfo import ZoneInfo
+
+          SITE = "https://yurikago-kobe.com"
+          BLOG = "yurikago_kobe"
+          API = f"https://livedoor.blogcms.jp/atom/blog/{BLOG}/article"
+          ATOM = "http://www.w3.org/2005/Atom"
+          APP = "http://www.w3.org/2007/app"
+          NS = {"atom": ATOM, "app": APP}
+          STATE_FILE = Path("automation/livedoor-sync-state.json")
+          AREAS = {"sannomiya": "三宮", "amagasaki": "JR尼崎"}
+
+
+          class Node:
+              def __init__(self, tag="", attrs=None):
+                  self.tag, self.attrs, self.children = tag, dict(attrs or []), []
+
+              def text(self):
+                  return " ".join(x.text() if isinstance(x, Node) else x for x in self.children).strip()
+
+              def find_all(self, tag=None, cls=None):
+                  for child in self.children:
+                      if not isinstance(child, Node):
+                          continue
+                      if (tag is None or child.tag == tag) and (cls is None or cls in child.attrs.get("class", "").split()):
+                          yield child
+                      yield from child.find_all(tag, cls)
+
+
+          class Document(HTMLParser):
+              VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+
+              def __init__(self, raw):
+                  super().__init__(convert_charrefs=True)
+                  self.root = Node()
+                  self.stack = [self.root]
+                  self.feed(raw)
+
+              def handle_starttag(self, tag, attrs):
+                  node = Node(tag, attrs)
+                  self.stack[-1].children.append(node)
+                  if tag not in self.VOID:
+                      self.stack.append(node)
+
+              def handle_startendtag(self, tag, attrs):
+                  self.handle_starttag(tag, attrs)
+                  if tag not in self.VOID:
+                      self.handle_endtag(tag)
+
+              def handle_endtag(self, tag):
+                  for index in range(len(self.stack) - 1, 0, -1):
+                      if self.stack[index].tag == tag:
+                          self.stack = self.stack[:index]
+                          break
+
+              def handle_data(self, data):
+                  self.stack[-1].children.append(data)
+
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+
+          def get_site(url):
+              if urllib.parse.urlsplit(url).netloc != "yurikago-kobe.com" or not url.startswith(SITE + "/"):
+                  raise RuntimeError("想定外の公式HPのURLです。")
+              req = urllib.request.Request(url, headers={"User-Agent": "YurikagoBlogSync/1.0"})
+              try:
+                  with urllib.request.build_opener(NoRedirect()).open(req, timeout=30) as res:
+                      if res.status != 200:
+                          raise RuntimeError("公式HPの取得に失敗しました。")
+                      return res.read(3_000_001).decode("utf-8")
+              except (urllib.error.URLError, TimeoutError, socket.timeout):
+                  raise RuntimeError("公式HPの取得に失敗しました。投稿せず停止します。") from None
+
+
+          def minutes(value):
+              match = re.fullmatch(r"(\d{1,2}):(\d{2})", value or "")
+              if not match or int(match[1]) > 29 or int(match[2]) > 59:
+                  raise RuntimeError("出勤時間の形式を確認できません。")
+              return int(match[1]) * 60 + int(match[2])
+
+
+          def schedule_rows(raw, day):
+              document = Document(raw).root
+              scripts = [n for n in document.find_all("script") if n.attrs.get("id") == "site-data"]
+              if len(scripts) != 1:
+                  raise RuntimeError("公式HPの出勤データ形式が変わりました。投稿せず停止します。")
+              data = json.loads(scripts[0].text())
+              if data.get("selectedDate") != day or data.get("scheduleConfirmed") is not True or data.get("scheduleStatus") != "confirmed":
+                  raise RuntimeError("対象日または出勤情報の確定状態を確認できません。")
+              records = data.get("records")
+              if not isinstance(records, list) or not records:
+                  raise RuntimeError("出勤データを確認できません。")
+              dates = [r.get("date", "") for r in records]
+              if any(not re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) for d in dates) or not min(dates) <= day <= max(dates):
+                  raise RuntimeError("対象日の出勤データが更新範囲外です。")
+              result, seen = {a: [] for a in AREAS}, set()
+              for row in records:
+                  if row.get("date") != day:
+                      continue
+                  area, name, sid = row.get("area"), row.get("staffName"), row.get("staffId")
+                  if area not in AREAS or not isinstance(name, str) or not name.strip() or not isinstance(sid, int):
+                      raise RuntimeError("出勤エリアまたはセラピスト情報が不明なため停止します。")
+                  start, end = minutes(row.get("start")), minutes(row.get("end"))
+                  if end <= start:
+                      end += 24 * 60
+                  if not 0 < end - start <= 18 * 60 or end > 30 * 60:
+                      raise RuntimeError("出勤時間の前後関係を確認できません。")
+                  unique = (area, sid, start, end)
+                  if unique in seen:
+                      raise RuntimeError("出勤データに重複があります。")
+                  seen.add(unique)
+                  result[area].append({"name": name.strip(), "sid": sid, "start": start, "end": end})
+              for rows in result.values():
+                  rows.sort(key=lambda r: (r["start"], r["end"], r["sid"]))
+              return result
+
+
+          def blog_cards(raw):
+              cards = list(Document(raw).root.find_all("article", "blog-card"))
+              if not cards:
+                  raise RuntimeError("公式HPブログの一覧形式を確認できません。")
+              result = {}
+              for card in cards:
+                  headings = list(card.find_all("h2"))
+                  if len(headings) != 1:
+                      raise RuntimeError("ブログ記事のタイトルを確認できません。")
+                  links = list(headings[0].find_all("a"))
+                  if len(links) != 1:
+                      raise RuntimeError("ブログ記事のURLを確認できません。")
+                  url = urllib.parse.urljoin(SITE + "/blog/", links[0].attrs.get("href", ""))
+                  parsed = urllib.parse.urlsplit(url)
+                  if parsed.scheme != "https" or parsed.netloc != "yurikago-kobe.com" or not parsed.path.startswith("/blog/") or parsed.path == "/blog/":
+                      raise RuntimeError("ブログ記事のURLが想定と異なります。")
+                  paragraphs = [n.text() for n in card.find_all("p")]
+                  summaries = [s for s in paragraphs if len(s) >= 30]
+                  if not summaries:
+                      raise RuntimeError("ブログ記事の紹介文を確認できません。")
+                  title = " ".join(headings[0].text().split())
+                  if not title or len(title) > 150:
+                      raise RuntimeError("ブログ記事のタイトルが想定と異なります。")
+                  summary = " ".join(summaries[-1].split())[:250]
+                  key = "blog:" + hashlib.sha256(url.encode()).hexdigest()[:24]
+                  result[key] = {"title": title, "summary": summary, "url": url}
+              return result
+
+
+          def item(key, title, body, kind):
+              marker = "yurikago-auto-v1:" + hashlib.sha256(key.encode()).hexdigest()
+              full_body = body + f"\n<!-- {marker} -->"
+              digest = hashlib.sha256(json.dumps([title, full_body], ensure_ascii=False).encode()).hexdigest()
+              return {"key": key, "title": title, "body": full_body, "marker": marker, "hash": digest, "kind": kind}
+
+
+          def footer(area=None):
+              areas = [area] if area else list(AREAS)
+              links = " ／ ".join(f'<a href="{SITE}/{a}#schedule">{AREAS[a]}の最新出勤</a>' for a in areas)
+              return (f"<p>{links}</p>"
+                      f'<p><a href="{SITE}/blog/">初めての方への利用ガイド</a></p>'
+                      f'<p>セラピスト求人のご案内は<a href="{SITE}/recruit.php">公式HPの求人ページ</a>をご覧ください。</p>')
+
+
+          def schedule_items(rows_by_area, day):
+              date = datetime.strptime(day, "%Y-%m-%d")
+              label = f"{date.month}/{date.day}（{'月火水木金土日'[date.weekday()]}）"
+              items = []
+              for area, name in AREAS.items():
+                  rows = rows_by_area[area]
+                  body = f"<h2>{label} {name}の出勤予定</h2>"
+                  body += f"<p>ゆりかご神戸尼崎の{name}ルームの出勤情報をご案内します。</p>"
+                  if rows:
+                      body += "<ul>" + "".join(
+                          f'<li><a href="{SITE}/profile.php?sid={r["sid"]}">{html.escape(r["name"])}</a>　'
+                          f'{r["start"] // 60:02d}:{r["start"] % 60:02d}～{r["end"] // 60:02d}:{r["end"] % 60:02d}</li>'
+                          for r in rows
+                      ) + "</ul>"
+                  else:
+                      body += "<p>現在、対象日の出勤予定は公式HPに掲載されていません。最新情報は受付へお問い合わせください。</p>"
+                  body += ("<p>※出勤予定と予約可能な時間は異なります。予定が変更される場合があります。"
+                           "最新の出勤と空き状況は、公式HP・受付へご確認ください。</p>"
+                           "<p>24:00以降の表記は翌日の深夜帯です。予約は受付からのご案内をもって確定します。</p>")
+                  body += footer(area)
+                  items.append(item(f"schedule:{day}:{area}", f"{label}{name}の出勤情報｜ゆりかご神戸尼崎", body, "schedule"))
+              return items
+
+
+          def scheduled_attendance_items(articles, state, now, trigger_kind):
+              if trigger_kind != "schedule" or now.hour >= 8:
+                  return articles
+              result = []
+              for article in articles:
+                  record = state["posts"].get(article["key"], {})
+                  if record.get("phase") == "active" and record.get("mode") == "publish" and record.get("article_id"):
+                      result.append(article)
+                  else:
+                      print(f"SKIP: 新しい出勤記事の自動公開は日本時間8:00以降です / {article['title']}")
+              return result
+
+
+          def news_items(cards, state):
+              posts = state["posts"]
+              if not state.get("blog_baseline_done"):
+                  for key in cards:
+                      posts[key] = {"phase": "baseline"}
+                  state["blog_baseline_done"] = True
+                  print(f"INFO: 既存ブログ{len(cards)}件を初回基準として登録します。一括転載は行いません。")
+                  return []
+              result = []
+              for key, card in cards.items():
+                  if posts.get(key, {}).get("phase") == "baseline":
+                      continue
+                  body = f'<p>{html.escape(card["summary"])}</p>'
+                  body += f'<p><a href="{html.escape(card["url"], quote=True)}">公式HPで記事の続きを読む</a></p>'
+                  result.append(item(key, card["title"] + "｜ゆりかご神戸尼崎", body + footer(), "blog"))
+              return result
+
+
+          def api_request(method, url, data=None):
+              if method not in {"GET", "POST", "PUT"} or (url != API and not re.fullmatch(re.escape(API) + r"/\d+", url)):
+                  raise RuntimeError("想定外のAPI操作です。")
+              username, password = os.environ["LIVEDOOR_ID"].strip(), os.environ["LIVEDOOR_API_PASSWORD"].strip()
+              created, nonce = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), os.urandom(20)
+              digest = base64.b64encode(hashlib.sha1(nonce + created.encode() + password.encode()).digest()).decode()
+              wsse = (f'UsernameToken Username="{username}", PasswordDigest="{digest}", '
+                      f'Nonce="{base64.b64encode(nonce).decode()}", Created="{created}"')
+              req = urllib.request.Request(url, method=method, data=data, headers={
+                  "Authorization": 'WSSE profile="UsernameToken"', "X-WSSE": wsse,
+                  "Accept": "application/atom+xml", "Content-Type": "application/atom+xml;type=entry;charset=utf-8",
+                  "User-Agent": "YurikagoBlogSync/1.0",
+              })
+              try:
+                  with urllib.request.build_opener(NoRedirect()).open(req, timeout=30) as res:
+                      if res.status not in (200, 201):
+                          raise RuntimeError(f"APIがHTTP {res.status}を返しました。")
+                      return res.headers.get("Location", ""), ET.fromstring(res.read())
+              except urllib.error.HTTPError as exc:
+                  raise RuntimeError(f"ライブドアAPIがHTTP {exc.code}を返しました。認証情報はログに表示しません。") from None
+              except (urllib.error.URLError, TimeoutError, socket.timeout):
+                  raise RuntimeError("API通信に失敗しました。新規投稿を自動再送せず停止します。") from None
+
+
+          def article_id(entry, location=""):
+              urls = [location] + [n.get("href", "") for n in entry.findall("atom:link", NS)]
+              for url in urls:
+                  p = urllib.parse.urlsplit(url)
+                  m = re.search(r"/" + re.escape(BLOG) + r"/article/(\d+)/?$", p.path)
+                  if p.hostname == "livedoor.blogcms.jp" and m:
+                      return m.group(1)
+              value = entry.findtext("atom:id", default="", namespaces=NS)
+              m = re.search(r"[./](\d+)$", value) if BLOG in value else None
+              if not m:
+                  raise RuntimeError("記事IDの確認が必要です。管理画面を確認してください。")
+              return m.group(1)
+
+
+          def draft_of(entry):
+              result = entry.findtext("app:control/app:draft", default="", namespaces=NS).strip()
+              if result not in {"yes", "no"}:
+                  raise RuntimeError("記事の公開状態を確認できません。")
+              return result
+
+
+          def owned(entry, article):
+              if entry.tag != f"{{{ATOM}}}entry" or article["marker"] not in ET.tostring(entry, encoding="unicode"):
+                  raise RuntimeError("自動投稿で作成した記事であることを確認できません。既存記事は変更しません。")
+
+
+          def payload(article, mode):
+              ET.register_namespace("", ATOM)
+              ET.register_namespace("app", APP)
+              entry = ET.Element(f"{{{ATOM}}}entry")
+              ET.SubElement(entry, f"{{{ATOM}}}title").text = article["title"]
+              ET.SubElement(entry, f"{{{ATOM}}}updated").text = datetime.now(timezone.utc).isoformat()
+              ET.SubElement(entry, f"{{{ATOM}}}content", {"type": "text/html"}).text = article["body"]
+              control = ET.SubElement(entry, f"{{{APP}}}control")
+              ET.SubElement(control, f"{{{APP}}}draft").text = "yes" if mode == "draft" else "no"
+              return ET.tostring(entry, encoding="utf-8", xml_declaration=True)
+
+
+          def read_state():
+              if not STATE_FILE.exists():
+                  return {"version": 1, "blog_baseline_done": False, "posts": {}}
+              state = json.loads(STATE_FILE.read_text())
+              if state.get("version") != 1 or not isinstance(state.get("posts"), dict):
+                  raise RuntimeError("保存済みの投稿履歴形式を確認できません。")
+              return state
+
+
+          def persist(state):
+              STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+              tmp = STATE_FILE.with_suffix(".tmp")
+              tmp.write_text(json.dumps(state, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+              tmp.replace(STATE_FILE)
+              commands = [
+                  ["git", "config", "user.name", "github-actions[bot]"],
+                  ["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"],
+                  ["git", "add", "--", str(STATE_FILE)],
+              ]
+              for cmd in commands:
+                  result = subprocess.run(cmd, capture_output=True, timeout=45)
+                  if result.returncode:
+                      raise RuntimeError("投稿履歴を保存できません。投稿処理を停止します。")
+              if subprocess.run(["git", "diff", "--cached", "--quiet", "--", str(STATE_FILE)], capture_output=True).returncode == 0:
+                  return
+              for cmd in [
+                  ["git", "commit", "--only", "-m", "Update Livedoor sync state [skip ci]", "--", str(STATE_FILE)],
+                  ["git", "push", "origin", "HEAD:main"],
+              ]:
+                  if subprocess.run(cmd, capture_output=True, timeout=60).returncode:
+                      raise RuntimeError("投稿履歴のGitHub保存に失敗しました。権限・同時更新を確認して再実行してください。")
+
+
+          def sync_one(article, state, mode, feed, save=persist, call=api_request):
+              key = article["key"]
+              record = state["posts"].get(key, {})
+              matches = [e for e in feed.findall("atom:entry", NS) if article["marker"] in ET.tostring(e, encoding="unicode")]
+              if len(matches) > 1:
+                  raise RuntimeError("同じ自動投稿の記事が複数あります。管理画面を確認してください。")
+              aid = record.get("article_id")
+              if aid is None and matches:
+                  aid = article_id(matches[0])
+              if aid is None and record.get("phase") == "creating":
+                  raise RuntimeError("前回の新規投稿結果が不明です。重複を避けて停止しました。記事一覧と投稿履歴を確認してください。")
+              if aid is None:
+                  state["posts"][key] = {"phase": "creating", "marker": article["marker"]}
+                  save(state)  # Persist intent BEFORE POST. An uncertain POST is never sent again blindly.
+                  location, created = call("POST", API, payload(article, mode))
+                  aid = article_id(created, location)
+                  print(f"CREATE: {article['title']} / 記事ID {aid}")
+              else:
+                  if not re.fullmatch(r"\d+", str(aid)):
+                      raise RuntimeError("投稿履歴の記事IDを確認できません。")
+                  _, current = call("GET", f"{API}/{aid}")
+                  owned(current, article)
+                  remote_mode = "draft" if draft_of(current) == "yes" else "publish"
+                  if mode == "draft" and remote_mode == "publish":
+                      active = {"phase": "active", "article_id": str(aid), "hash": record.get("hash", ""), "mode": "publish"}
+                      if record != active:
+                          state["posts"][key] = active
+                          save(state)
+                      print(f"SKIP: 公開済みの記事は下書きに戻しません / 記事ID {aid}")
+                      return
+                  if record.get("hash") == article["hash"] and remote_mode == mode and record.get("phase") == "active":
+                      print(f"SKIP: 変更なし / {article['title']}")
+                      return
+                  call("PUT", f"{API}/{aid}", payload(article, mode))
+                  print(f"UPDATE: {article['title']} / 記事ID {aid}")
+              _, saved = call("GET", f"{API}/{aid}")
+              owned(saved, article)
+              expected = "yes" if mode == "draft" else "no"
+              if draft_of(saved) != expected or saved.findtext("atom:title", default="", namespaces=NS) != article["title"]:
+                  raise RuntimeError("保存後の記事内容または公開状態の確認に失敗しました。")
+              state["posts"][key] = {"phase": "active", "article_id": str(aid), "hash": article["hash"], "mode": mode}
+              save(state)
+              print(f"OK: 保存後の確認成功 / 記事ID {aid} / draft={expected}")
+
+
+          def main():
+              mode = os.environ.get("SYNC_MODE", "preview")
+              if mode not in {"preview", "draft", "publish"}:
+                  raise RuntimeError("実行モードを確認してください。")
+              now = datetime.now(ZoneInfo("Asia/Tokyo"))
+              day = (now - timedelta(hours=2)).date().isoformat()
+              raw = get_site(f"{SITE}/schedule.php?date={day}")
+              rows = schedule_rows(raw, day)
+              cards = blog_cards(get_site(SITE + "/blog/"))
+              for area, values in rows.items():
+                  print(f"OK: {AREAS[area]}の出勤データ抽出 / {day} / {len(values)}名")
+              print(f"OK: 公式HPブログの記事一覧抽出 / {len(cards)}件")
+              state = read_state()
+              attendance = scheduled_attendance_items(
+                  schedule_items(rows, day), state, now, os.environ.get("TRIGGER_KIND", "workflow_dispatch")
+              )
+              articles = attendance + news_items(cards, state)
+              new_blogs = [a for a in articles if a["kind"] == "blog" and a["key"] not in state["posts"]]
+              if len(new_blogs) > 3:
+                  raise RuntimeError("新規ブログが一度に4件以上見つかりました。一括投稿せず確認のため停止します。")
+              if mode == "preview":
+                  for article in articles:
+                      print("\nTITLE: " + article["title"])
+                      print(article["body"])
+                  print("\nOK: 記事のプレビュー作成完了。ライブドア投稿・履歴保存は行っていません。")
+                  summary = os.environ.get("GITHUB_STEP_SUMMARY")
+                  if summary:
+                      with open(summary, "a") as f:
+                          f.write("## 自動反映する記事のプレビュー\n\n")
+                          for a in articles:
+                              f.write("### " + a["title"] + "\n\n" + a["body"] + "\n\n")
+                  return
+              username, password = os.environ.get("LIVEDOOR_ID", "").strip(), os.environ.get("LIVEDOOR_API_PASSWORD", "").strip()
+              if not re.fullmatch(r"[A-Za-z0-9_-]+", username) or not password or any(c in password for c in "\r\n"):
+                  raise RuntimeError("GitHub SecretsのLIVEDOOR_IDとLIVEDOOR_API_PASSWORDを確認してください。")
+              if os.environ.get("GITHUB_REPOSITORY") != "yurikagokobe-boop/yurikago-blog-auto" or os.environ.get("GITHUB_REF") != "refs/heads/main":
+                  raise RuntimeError("対象リポジトリのmainブランチで実行してください。")
+              _, feed = api_request("GET", API)
+              if feed.tag != f"{{{ATOM}}}feed":
+                  raise RuntimeError("ライブドアの記事一覧を確認できません。")
+              persist(state)
+              for article in articles:
+                  sync_one(article, state, mode, feed)
+              print("OK: 自動反映処理が完了しました。")
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except (RuntimeError, ValueError, KeyError, TypeError, OSError, ET.ParseError, subprocess.TimeoutExpired) as exc:
+                  print("ERROR: " + str(exc))
+                  raise SystemExit(1)
+          PYTHON
