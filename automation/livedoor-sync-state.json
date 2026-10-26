@@ -90,6 +90,10 @@
       "hash": "81b599b1281f9895095caeb4ddef61d5b86292d5075d659e172c75743c72201b",
       "mode": "publish",
       "phase": "active"
+    },
+    "schedule:2026-10-27:sannomiya": {
+      "marker": "yurikago-auto-v1:f99f9cc3a857cb96544497f9332aeb9473bc876ffae553d17c1798106e3bd571",
+      "phase": "creating"
     }
   },
   "version": 1
