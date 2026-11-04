@@ -198,6 +198,10 @@
       "hash": "c696eb111289b14a840eb9768a4e7052471b6234251268a9945ac580fc5ad2a8",
       "mode": "publish",
       "phase": "active"
+    },
+    "schedule:2026-11-05:sannomiya": {
+      "marker": "yurikago-auto-v1:70a6ef7c5c9f39b3f1548839f108dfe5a0754cb7815fa9d429ee912f5714d923",
+      "phase": "creating"
     }
   },
   "version": 1
