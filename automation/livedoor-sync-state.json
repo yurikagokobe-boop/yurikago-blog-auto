@@ -5,8 +5,10 @@
       "phase": "baseline"
     },
     "blog:7e76e827b2c82b49b427fb93": {
-      "marker": "yurikago-auto-v1:a8d82555f2f991e9b7bd3da1d684c06bd7a62c3cabcf7a548615e4e8d3ee8d5b",
-      "phase": "creating"
+      "article_id": "31095230",
+      "hash": "fa3fc62b39da2f35e3655aabf8efc4da9aca17cee8af5a4aff9d2fee72f67e5e",
+      "mode": "publish",
+      "phase": "active"
     },
     "blog:eda0f6576108b10eb3022371": {
       "phase": "baseline"
