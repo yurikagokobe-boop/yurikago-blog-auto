@@ -290,8 +290,10 @@
       "phase": "active"
     },
     "schedule:2026-11-12:amagasaki": {
-      "marker": "yurikago-auto-v1:1798a993976dd6584dc46799f676e431ed4606923de3bc1069a2d754eac9de00",
-      "phase": "creating"
+      "article_id": "31100680",
+      "hash": "3728b16d6c5c54e78388d89fc630147634fb2e67a26443c31eac1a655f6fde0f",
+      "mode": "publish",
+      "phase": "active"
     },
     "schedule:2026-11-12:sannomiya": {
       "article_id": "31100679",
