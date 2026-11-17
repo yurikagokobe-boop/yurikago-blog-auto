@@ -362,8 +362,10 @@
       "phase": "active"
     },
     "schedule:2026-11-18:sannomiya": {
-      "marker": "yurikago-auto-v1:0fd412aa0b7f958dba9cc0f297f0bee487b64ae8b9c9e5194089b0244cf96f08",
-      "phase": "creating"
+      "article_id": "31125114",
+      "hash": "f805bfbcf78ef3724948ea8e89ea4c614db8892d6d5343e2e64b4071ab327452",
+      "mode": "publish",
+      "phase": "active"
     }
   },
   "version": 1
